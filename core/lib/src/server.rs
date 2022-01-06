@@ -75,11 +75,13 @@ async fn hyper_service_fn(
         let (h_parts, mut h_body) = hyp_req.into_parts();
         match Request::from_hyp(&rocket, &h_parts, Some(conn)) {
             Ok(mut req) => {
+                // MEMBRANE: only log if not health-check
+                let log_ok = req.uri().path() != "/";
                 // Convert into Rocket `Data`, dispatch request, write response.
                 let mut data = Data::from(&mut h_body);
                 let token = rocket.preprocess_request(&mut req, &mut data).await;
                 let response = rocket.dispatch(token, &mut req, data).await;
-                rocket.send_response(response, tx).await;
+                rocket.send_response(response, tx, log_ok).await;
             },
             Err(e) => {
                 // TODO: We don't have a request to pass in, so we fabricate
@@ -88,7 +90,7 @@ async fn hyper_service_fn(
                 error!("Bad incoming request: {}", e);
                 let dummy = Request::new(&rocket, Method::Get, Origin::ROOT);
                 let response = rocket.handle_error(Status::BadRequest, &dummy).await;
-                rocket.send_response(response, tx).await;
+                rocket.send_response(response, tx, true).await;
             }
         }
     });
@@ -104,6 +106,7 @@ impl Rocket<Orbit> {
         &self,
         response: Response<'_>,
         tx: oneshot::Sender<hyper::Response<hyper::Body>>,
+        log_ok: bool,
     ) {
         let remote_hungup = |e: &io::Error| match e.kind() {
             | io::ErrorKind::BrokenPipe
@@ -113,7 +116,8 @@ impl Rocket<Orbit> {
         };
 
         match self._send_response(response, tx).await {
-            Ok(()) => info_!("{}", Paint::green("Response succeeded.")),
+            Ok(()) if log_ok => info_!("{}", Paint::green("Response succeeded.")),
+            Ok(()) => {},
             Err(e) if remote_hungup(&e) => warn_!("Remote left: {}.", e),
             Err(e) => warn_!("Failed to write response: {}.", e),
         }
@@ -200,7 +204,10 @@ impl Rocket<Orbit> {
         request: &'r Request<'s>,
         data: Data<'r>
     ) -> Response<'r> {
-        info!("{}:", request);
+        // MEMBRANE: only log if not health-check
+        if request.uri().path() != "/" {
+            info!("{}:", request);
+        }
 
         // Remember if the request is `HEAD` for later body stripping.
         let was_head_request = request.method() == Method::Head;
@@ -272,8 +279,11 @@ impl Rocket<Orbit> {
     ) -> route::Outcome<'r> {
         // Go through the list of matching routes until we fail or succeed.
         for route in self.router.route(request) {
+            // MEMBRANE: only log if not health-check
+            if route.uri.path() != "/" {
+                info_!("Matched: {}", route);
+            }
             // Retrieve and set the requests parameters.
-            info_!("Matched: {}", route);
             request.set_route(route);
 
             let name = route.name.as_deref();
@@ -283,7 +293,10 @@ impl Rocket<Orbit> {
             // Check if the request processing completed (Some) or if the
             // request needs to be forwarded. If it does, continue the loop
             // (None) to try again.
-            info_!("{} {}", Paint::default("Outcome:").bold(), outcome);
+            // MEMBRANE: only log if not health-check
+            if route.uri.path() != "/" {
+                info_!("{} {}", Paint::default("Outcome:").bold(), outcome);
+            }
             match outcome {
                 o@Outcome::Success(_) | o@Outcome::Failure(_) => return o,
                 Outcome::Forward(unused_data) => data = unused_data,
